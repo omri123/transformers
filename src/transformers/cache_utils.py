@@ -53,6 +53,61 @@ class Cache:
             return max_length - new_seq_length
         return previous_seq_length
 
+class DistributedCache(Cache):
+    """
+    A cache that is distributed between multiple devices.
+    The last device is the central node, and new tokens are appended on it.
+    """
+    def __init__(self):
+        # cache[i][j]: the part of the cache stored on device `i` for layer `j`.
+        self.static_key_cache: List[List[torch.Tensor]] = []
+        self.static_value_cache: List[List[torch.Tensor]] = []
+        # The dynaic part of the cache. Sit on centeral device, updated on each new token.
+        self.dynamic_cache: DynamicCache = DynamicCache()
+        self.seen_tokens = 0
+
+    def save_static_cache(self, keys: List[List[torch.Tensor]], values: List[List[torch.Tensor]]):
+        self.static_key_cache = keys
+        self.static_value_cache = values
+        self.seen_tokens = self.get_seq_length()
+    
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+        cache_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        result = self.dynamic_cache.update(key_states, value_states, layer_idx, cache_kwargs)
+        self.seen_tokens = self.get_seq_length()
+        return result
+    
+    def my_update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+        cache_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        dynamic = self.dynamic_cache.update(key_states, value_states, layer_idx, cache_kwargs)
+        keys = [key[layer_idx] for key in self.static_key_cache] + [dynamic[0]]
+        values = [value[layer_idx] for value in self.static_value_cache] + [dynamic[1]]
+        self.seen_tokens = self.get_seq_length()
+        return keys, values
+    
+    def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
+        lenghs = [key[layer_idx].shape[-2] for key in self.static_key_cache]
+        return sum(lenghs) + self.dynamic_cache.get_seq_length(layer_idx)
+    
+    def get_recent_seq_lengh(self, layer_idx: Optional[int] = 0) -> int:
+        return self.dynamic_cache.get_seq_length(layer_idx)
+    
+    def get_max_length(self) -> Optional[int]:
+        # No maximum.
+        return None
+
+    
+    
 
 class DynamicCache(Cache):
     """

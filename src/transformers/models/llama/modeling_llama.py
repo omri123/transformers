@@ -29,7 +29,7 @@ from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 from ...activations import ACT2FN
-from ...cache_utils import Cache, DynamicCache
+from ...cache_utils import Cache, DynamicCache, DistributedCache
 from ...modeling_attn_mask_utils import (
     AttentionMaskConverter,
     _prepare_4d_attention_mask,
@@ -49,6 +49,7 @@ from ...utils import (
 )
 from ...utils.import_utils import is_torch_fx_available
 from .configuration_llama import LlamaConfig
+from ...partial import PartialSoftmax
 
 
 if is_flash_attn_2_available():
@@ -452,6 +453,130 @@ class LlamaAttention(nn.Module):
 
         return attn_output, attn_weights, past_key_value
 
+class LlamaDistributedAttention(LlamaAttention):
+    """
+    Multi-headed attention from 'Attention Is All You Need' paper,
+    Splitted to allow distributing the attention over cache.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.partial_attention = DistributedAttentionNode(self.num_heads, self.head_dim, self.attention_dropout, self.num_key_value_groups)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[DistributedCache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        bsz, q_len, _ = hidden_states.size()
+        central_device = hidden_states.device
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        cos, sin = self.rotary_emb(value_states, seq_len=2048)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, torch.remainder(position_ids, 2048))
+
+        if past_key_value is not None:
+            cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
+            # List[torch.Tensor], List[torch.Tensor]
+            key_states, value_states = past_key_value.my_update(key_states, value_states, self.layer_idx, cache_kwargs)
+        
+        # magic will start here
+        attn_denuminators = []
+        kv_done_so_far = 0
+        for keys_values in zip(key_states, value_states):
+            attetion_mask_chunk = attention_mask[:, :, :, kv_done_so_far:keys_values[0].shape[-2]].to(keys_values[0].device)
+            kv_done_so_far += keys_values[0].shape[-2]
+            _, den = self.partial_attention(query_states, keys_values, attetion_mask_chunk, den=None)
+            attn_denuminators.append(den.to(central_device))
+        den = sum(attn_denuminators)
+        
+        attn_outputs_static_cache = []
+        kv_done_so_far = 0
+        for keys_values in zip(key_states, value_states):
+            # (bsz, 1, q_len, kv_seq_len):
+            attetion_mask_chunk = attention_mask[:, :, :, kv_done_so_far:keys_values[0].shape[-2]].to(keys_values[0].device)
+            kv_done_so_far += keys_values[0].shape[-2]
+            attn_output, _ = self.partial_attention(query_states, keys_values, attetion_mask_chunk, den=den.to(keys_values[0].device))
+            attn_outputs_static_cache.append(attn_output.to(central_device))
+        
+        attn_output = sum(attn_outputs_static_cache)
+        # magic will end here!
+
+        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+            raise ValueError(
+                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+                f" {attn_output.size()}"
+            )
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+
+        attn_output = self.o_proj(attn_output)
+
+        if not output_attentions:
+            attn_weights = None
+
+        return attn_output, attn_weights, past_key_value
+        
+
+class DistributedAttentionNode(nn.Module):
+    def __init__(self, num_heads, head_dim, attention_dropout, num_key_value_groups):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.attention_dropout = attention_dropout
+        self.num_key_value_groups = num_key_value_groups
+    
+    def forward(
+        self,
+        query_states: torch.Tensor,
+        past_key_value: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor] = None,
+        den = None # softmax denuminator
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        key_states, value_states = past_key_value
+        bsz, _, q_len, _ = query_states.size()
+        kv_seq_len = key_states.shape[-2]
+        # magic will start here...
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
+            raise ValueError(
+                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
+                f" {attn_weights.size()}"
+            )
+        
+        if attention_mask is not None:
+            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+                raise ValueError(
+                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                )
+            attn_weights = attn_weights + attention_mask
+            
+        # upcast attention to fp32
+        if den is None:
+            attn_weights, den = PartialSoftmax.softmax(attn_weights.to(torch.float32), dim=-1)
+        else:
+            attn_weights = PartialSoftmax.partial_softmax(attn_weights.to(torch.float32), dim=-1, den=den)
+        attn_weights = attn_weights.to(query_states.dtype)
+        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        attn_output = torch.matmul(attn_weights, value_states)
+        # magic will end here!
+        return attn_output, den
 
 class LlamaFlashAttention2(LlamaAttention):
     """
@@ -1011,9 +1136,11 @@ class LlamaModel(LlamaPreTrainedModel):
 
         past_key_values_length = 0
         if use_cache:
-            use_legacy_cache = not isinstance(past_key_values, Cache)
-            if use_legacy_cache:
-                past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+            if past_key_values is None:
+                past_key_values = DistributedCache()
+            elif not isinstance(past_key_values, DistributedCache):
+                raise Exception("past_key_values should be a DistributedCache")
+            
             past_key_values_length = past_key_values.get_usable_length(seq_length)
 
         if position_ids is None:
@@ -1092,7 +1219,7 @@ class LlamaModel(LlamaPreTrainedModel):
 
         next_cache = None
         if use_cache:
-            next_cache = next_decoder_cache.to_legacy_cache() if use_legacy_cache else next_decoder_cache
+            next_cache = next_decoder_cache
         if not return_dict:
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
         return BaseModelOutputWithPast(
