@@ -495,7 +495,7 @@ class LlamaDistributedAttention(LlamaAttention):
         attn_denuminators = []
         kv_done_so_far = 0
         for keys_values in zip(key_states, value_states):
-            attetion_mask_chunk = attention_mask[:, :, :, kv_done_so_far:keys_values[0].shape[-2]].to(keys_values[0].device)
+            attetion_mask_chunk = attention_mask[:, :, :, kv_done_so_far:kv_done_so_far+keys_values[0].shape[-2]].to(keys_values[0].device)
             kv_done_so_far += keys_values[0].shape[-2]
             _, den = self.partial_attention(query_states, keys_values, attetion_mask_chunk, den=None)
             attn_denuminators.append(den.to(central_device))
@@ -505,7 +505,7 @@ class LlamaDistributedAttention(LlamaAttention):
         kv_done_so_far = 0
         for keys_values in zip(key_states, value_states):
             # (bsz, 1, q_len, kv_seq_len):
-            attetion_mask_chunk = attention_mask[:, :, :, kv_done_so_far:keys_values[0].shape[-2]].to(keys_values[0].device)
+            attetion_mask_chunk = attention_mask[:, :, :, kv_done_so_far:kv_done_so_far+keys_values[0].shape[-2]].to(keys_values[0].device)
             kv_done_so_far += keys_values[0].shape[-2]
             attn_output, _ = self.partial_attention(query_states, keys_values, attetion_mask_chunk, den=den.to(keys_values[0].device))
             attn_outputs_static_cache.append(attn_output.to(central_device))
