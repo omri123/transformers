@@ -14,16 +14,7 @@ def create_normal_llama(model_name_or_config):
     model = AutoModelForCausalLM.from_pretrained(model_name_or_config, attn_implementation="eager")
     return model
 
-def calculate_kv_cache(model, inputs):
-    results = model.generate(inputs, max_new_tokens=1, return_dict_in_generate=True)
-    cache = results['past_key_values']
-    if not isinstance(cache, DistributedCache):
-        raise TypeError("Model must be a distributed model")
-    if not cache.get_seq_length() == inputs.shape[1]: # todo crop!
-        raise ValueError("Wrong cache size")
-    return cache
-
-def calculate_kv_static_cache(model, inputs):
+def calculate_kv_cache(model, inputs): # TODO: better with regular attention and Dynamic cache, to enjoy sliding context window?
     results = model.generate(inputs, max_new_tokens=1, return_dict_in_generate=True)
     cache = results['past_key_values']
     if not isinstance(cache, DistributedCache):

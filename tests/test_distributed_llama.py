@@ -41,15 +41,7 @@ class DistributedLlamaTests(unittest.TestCase):
         decoded = self.tokenizer.batch_decode(generated_ids)
         self.assertEqual(decoded[0], self.response)
     
-    def test_generate_with_static_cache(self):
-        model = create_distributed_llama(self.model_name)
-        encodeds = self.convert_text_to_ids(self.prompt)
-        cache = calculate_kv_static_cache(model, encodeds)
-        generated_ids = generate(model, self.convert_text_to_ids('heavens'), cache, max_new_tokens=3, do_sample=False)
-        decoded = self.tokenizer.batch_decode(generated_ids)
-        self.assertEqual(decoded[0], self.response)
-    
-    # def test_generate_with_long_cache(self):
+    # def test_generate_with_long_cache(self): # Maybe just long context?
     #     pass
     
     # def test_generate_with_distributed_cache(self):
