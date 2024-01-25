@@ -71,6 +71,16 @@ class DistributedCache(Cache):
         self.static_value_cache = values
         self.seen_tokens = self.get_seq_length()
     
+    def move_dynamic_to_static(self):
+        self.append_static_cache(self.dynamic_cache.key_cache, self.dynamic_cache.value_cache)
+        self.dynamic_cache = DynamicCache()
+        self.seen_tokens = self.get_seq_length()
+    
+    def append_static_cache(self, keys: List[torch.Tensor], values: List[torch.Tensor]):
+        self.static_key_cache.append(keys)
+        self.static_value_cache.append(values)
+        self.seen_tokens = self.get_seq_length()
+    
     def update(
         self,
         key_states: torch.Tensor,
