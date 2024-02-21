@@ -1,3 +1,5 @@
+Omris Note: I cloned this repo to test thoughts about distributed attention calculation, together with parallel context window
+
 <!---
 Copyright 2020 The HuggingFace Team. All rights reserved.
 
